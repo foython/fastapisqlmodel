@@ -35,31 +35,7 @@ def get_session():
     with Session(engine) as session:
         yield session
 
-@app.get('/notes', response_model=List[Note])
-def get_notes(is_done : Optional[bool]=None, session: Session = Depends(get_session)):
-    statement = select(Note)
-    if is_done is not None:
-        note = statement.where(Note.is_done == is_done)
-        note = note.order_by(Note.created_at.desc())
-        return session.exec(note).all()
-    return session.exec(statement).all()
 
-
-@app.get('/notes/{id}', response_model=Note)
-def get_notes(id:int, session: Session = Depends(get_session)):
-    note = session.get(Note, id)
-    if not note:
-        raise HTTPException(status_code=400, detail='Note not found')
-    return note
-
-
-@app.post('/notes', response_model=Note)
-def add_note(payload:NoteCreate, session: Session = Depends(get_session)):
-    note = Note.model_validate(payload)
-    session.add(note)
-    session.commit()
-    session.refresh(note)
-    return note
 
 from models import UserRead, UserCreate, User, UserUpdate
 
@@ -68,16 +44,38 @@ from models import UserRead, UserCreate, User, UserUpdate
 @app.post("/register", response_model=UserRead) 
 def register(user_in: UserCreate, session: Session = Depends(get_session)):
 
-    db_user = User(
-        email=user_in.email,
-        first_name=user_in.first_name,
-        last_name=user_in.last_name,
-        hashed_password=hash_pass(user_in.password) # Hash it!
-    )
-    session.add(db_user)
-    session.commit()
-    session.refresh(db_user)
-    return db_user # hashed_password is removed automatically by response_model
+    existing_user = session.exec(
+        select(User).where(User.email == user_in.email)
+    ).first()
+    
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A user with this email already exists."
+        )
+
+    try:
+        hashed_password = hash_pass(user_in.password)
+        
+        db_user = User(
+            email=user_in.email,
+            first_name=user_in.first_name,
+            last_name=user_in.last_name,
+            hashed_password=hashed_password
+        )
+        
+        session.add(db_user)
+        session.commit()
+        session.refresh(db_user)
+        return db_user
+        
+    except Exception as e:
+        session.rollback()
+        print(f"Database Error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail="Internal server error occurred."
+        )
 
 
 
@@ -156,3 +154,84 @@ def update_my_data(
     session.commit()
     session.refresh(current_user)
     return current_user
+
+
+@app.get('/notes', response_model=List[Note])
+def get_notes(
+    is_done: Optional[bool] = None, 
+    current_user: User = Depends(get_current_user), 
+    session: Session = Depends(get_session)
+):
+    # 1. Start with a base statement filtered by the CURRENT user
+    statement = select(Note).where(Note.user_id == current_user.id)
+    
+    # 2. Add optional filter for "is_done"
+    if is_done is not None:
+        statement = statement.where(Note.is_done == is_done)
+    
+    # 3. Apply ordering (best practice to show newest first)
+    statement = statement.order_by(Note.created_at.desc())
+    
+    # 4. Execute the final built query
+    notes = session.exec(statement).all()
+    return notes
+
+
+@app.get('/notes/{id}', response_model=Note)
+def get_notes_by_id(id:int, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):    
+    note = session.get(Note, id)
+    if not note:
+        raise HTTPException(status_code=400, detail='Note not found')
+    if note.user_id != current_user.id:
+        raise HTTPException(status_code=401, detail='You are not authourise')
+    return note
+
+
+@app.post('/notes', response_model=Note)
+def add_note(payload:NoteCreate, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    bd_note = Note(
+        title=payload.title,
+        content=payload.content,
+        user_id=current_user.id
+    )
+    session.add(bd_note)
+    session.commit()
+    session.refresh(bd_note)
+    return bd_note
+
+@app.patch('/notes/{note_id}', response_model=Note)
+def update_note(
+    note_id: int, 
+    payload: NoteUpdate, 
+    session: Session = Depends(get_session), 
+    current_user: User = Depends(get_current_user)
+):
+    db_note = session.get(Note, note_id)
+    
+    if not db_note:
+        raise HTTPException(status_code=404, detail="Note not found")
+        
+    if db_note.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="You don't have permission to update this note"
+        )
+
+    try:
+        update_data = payload.model_dump(exclude_unset=True)
+        
+        for key, value in update_data.items():
+            setattr(db_note, key, value)
+       
+        session.add(db_note)
+        session.commit()
+        session.refresh(db_note)
+        return db_note
+
+    except Exception as e:
+        session.rollback()
+        print(f"Error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail="Internal server error occurred."
+        )
